@@ -6,7 +6,8 @@ import (
 	"io"
 	"net"
 	"reflect"
-	"runtime"
+	"runtime/pprof"
+	"strings"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -114,6 +115,12 @@ func (m *mockReceivedPacketHandler) ReceivedStopWaiting(*frames.StopWaitingFrame
 }
 
 var _ ackhandler.ReceivedPacketHandler = &mockReceivedPacketHandler{}
+
+func areSessionsRunning() bool {
+	var b bytes.Buffer
+	pprof.Lookup("goroutine").WriteTo(&b, 1)
+	return strings.Contains(b.String(), "quic-go.(*session).run")
+}
 
 var _ = Describe("Session", func() {
 	var (
@@ -620,20 +627,15 @@ var _ = Describe("Session", func() {
 	})
 
 	Context("closing", func() {
-		var (
-			nGoRoutinesBefore int
-		)
-
 		BeforeEach(func() {
-			time.Sleep(10 * time.Millisecond) // Wait for old goroutines to finish
-			nGoRoutinesBefore = runtime.NumGoroutine()
+			Eventually(areSessionsRunning).Should(BeFalse())
 			go sess.run()
-			Eventually(func() int { return runtime.NumGoroutine() }).Should(Equal(nGoRoutinesBefore + 2))
+			Eventually(areSessionsRunning).Should(BeTrue())
 		})
 
 		It("shuts down without error", func() {
 			sess.Close(nil)
-			Eventually(func() int { return runtime.NumGoroutine() }).Should(Equal(nGoRoutinesBefore))
+			Eventually(areSessionsRunning).Should(BeFalse())
 			Expect(mconn.written).To(HaveLen(1))
 			Expect(mconn.written[0][len(mconn.written[0])-7:]).To(Equal([]byte{0x02, byte(qerr.PeerGoingAway), 0, 0, 0, 0, 0}))
 			Expect(closeCallbackCalled).To(BeTrue())
@@ -643,7 +645,7 @@ var _ = Describe("Session", func() {
 		It("only closes once", func() {
 			sess.Close(nil)
 			sess.Close(nil)
-			Eventually(func() int { return runtime.NumGoroutine() }).Should(Equal(nGoRoutinesBefore))
+			Eventually(areSessionsRunning).Should(BeFalse())
 			Expect(mconn.written).To(HaveLen(1))
 			Expect(sess.runClosed).ToNot(Receive()) // channel should be drained by Close()
 		})
@@ -653,7 +655,7 @@ var _ = Describe("Session", func() {
 			s, err := sess.GetOrOpenStream(5)
 			Expect(err).NotTo(HaveOccurred())
 			sess.Close(testErr)
-			Eventually(func() int { return runtime.NumGoroutine() }).Should(Equal(nGoRoutinesBefore))
+			Eventually(areSessionsRunning).Should(BeFalse())
 			Expect(closeCallbackCalled).To(BeTrue())
 			n, err := s.Read([]byte{0})
 			Expect(n).To(BeZero())
@@ -667,7 +669,7 @@ var _ = Describe("Session", func() {
 		It("closes the session in order to replace it with another QUIC version", func() {
 			sess.Close(errCloseSessionForNewVersion)
 			Expect(closeCallbackCalled).To(BeFalse())
-			Eventually(func() int { return runtime.NumGoroutine() }).Should(Equal(nGoRoutinesBefore))
+			Eventually(areSessionsRunning).Should(BeFalse())
 			Expect(atomic.LoadUint32(&sess.closed) != 0).To(BeTrue())
 			Expect(mconn.written).To(BeEmpty()) // no CONNECTION_CLOSE or PUBLIC_RESET sent
 		})
